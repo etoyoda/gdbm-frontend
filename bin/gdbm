@@ -410,6 +410,8 @@ EOF
       die!("unknown db engine (#{dbname})")
     end
     @of.close
+  rescue Errno::EPIPE
+    nil
   end
 
 end
