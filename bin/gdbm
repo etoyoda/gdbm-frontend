@@ -1,0 +1,417 @@
+#!/usr/bin/ruby
+
+class App
+
+ECM = 2
+ENL = 4
+ERR = 1
+
+Help = <<EOF
+usage: #$0 [options] <dbfile> [commands ...]
+command:
+  keys			[Array] all keys
+  val <key>		[String] value for <key>
+  key <val>		[String] a key that has specified <value>
+  dump			[Hash] all records
+  select <regexp>	[Hash] records that matches <regexp>
+  reject <regexp>	[Hash] records that does not match <regexp>
+  size			[String] number of records in decimal
+  store <key> <val>	stores a record
+  check <key> <val>	fails if stored value for <key> is not <val>
+  delete <key>		deletes a record for <key>
+  clear			deletes all records
+  isempty		fails if db is not empty
+  haskey <key>		fails if db does not contain <key>
+  merge <dbfile2>	updates <dbfile> with contents of <dbfile2>
+  import <textfile>	imports <textfile> (option fmt= applies)
+  reorganize
+options:
+  db=sdbm|dbm|gdbm		storage engine
+  of=-|<filename>		output file (- for stdout)
+  fmt=tabs|csv|lines|json|yaml	import/output format
+  enc=raw|dump|qp|base64	key/value encoding
+exit codes:
+  #{ECM}=fail by command / #{ENL}=newline check / #{ERR}=other error
+EOF
+
+  def warn msg
+    STDERR.puts msg
+  end
+
+  def die! msg
+    STDERR.puts Help
+    die msg
+  end
+
+  def die msg, rc = ERR
+    STDERR.puts "Error: #{msg}"
+    exit rc
+  end
+
+  def initialize argv
+    @db = :SDBM
+    @of = STDOUT
+    @fmt = :TABS
+    @dec, @enc = :dec_raw, :enc_raw
+    @chk = :ERR
+    self.db= $& if /(dbm|gdbm|sdbm)/i =~ File.basename($0)
+    while /\A(\w{2,3}=)/ =~ argv.first
+      opt, val = $1, $'
+      args = argv.shift
+      optsy = opt.to_sym
+      if self.respond_to?(optsy)
+        self.send(optsy, val)
+      else
+	die!("unknown option (#{args})")
+      end
+    end
+    @dbfile = argv.shift
+    @argv = argv
+    @hdb = nil
+  end
+
+  def db= dbname
+    puts "db=#{dbname}" if $DEBUG
+    @db = dbname.upcase.to_sym
+  end
+
+  def fmt= fmt
+    @fmt = fmt.upcase.to_sym
+    case @fmt
+    when :JSON then require 'json'
+    when :YAML then require 'yaml'
+    end
+  end
+
+  def enc= enc
+    @dec = "dec_#{enc.downcase}".to_sym
+    @enc = "enc_#{enc.downcase}".to_sym
+    die("unknown enc=#{enc}") unless self.respond?(@enc)
+  end
+
+  def of= filename
+    case filename
+    when /\A-?\z/ then
+      @of = STDOUT
+    else
+      @of = File.open(filename, "w")
+    end
+  end
+
+  # encoding handler
+
+  def enc_raw str
+    str
+  end
+
+  def dec_raw str
+    str
+  end
+
+  def enc_dump str
+    str.gsub(/\\/, "\\").gsub(/\r/, "\\r").gsub(/\n/, "\\n").gsub(/\t/, "\\t")
+  end
+
+  def dec_dump str
+    str.gsub(/\\[trn\\]/) {|pat|
+      case pat
+      when "\\\\" then "\\"
+      when "\\t" then "\t"
+      when "\\r" then "\r"
+      when "\\n" then "\n"
+      end
+    }
+  end
+
+  def enc_qp str
+    [str].pack('M').chop
+  end
+
+  def dec_qp str
+    str.unpack('M')
+  end
+
+  def enc_base64 str
+    [str].pack('m').chop
+  end
+
+  def dec_base64 str
+    str.unpack('m')
+  end
+
+  # output routines
+
+  def print_a ary
+    case @fmt
+    when :TABS
+      ary.each{|str|
+        xstr = self.send(@enc, str)
+        die("newline or tab in value", ENL) if /[\r\n\t]/ =~ xstr
+        @of.puts(xstr)
+      }
+    when :CSV
+      ary.each{|str|
+        xstr = self.send(@enc, str).gsub(/"/, '""')
+        die("newline in value", ENL) if /[\r\n]/ =~ xstr
+        @of.puts(['"', xstr, '"'].join)
+      }
+    when :LINES
+      ary.each{|str|
+        xstr = self.send(@enc, str)
+        die("newline in value", ENL) if /[\r\n]/ =~ xstr
+        @of.puts(xstr)
+      }
+      @of.puts('')
+    when :JSON
+      JSON.dump(ary, @of)
+      @of.puts('')
+    when :YAML
+      YAML.dump(ary, @of)
+      @of.puts('')
+    end
+  end
+
+  def print_s str
+    print_a [str]
+  end
+
+  def print_h hash
+    case @fmt
+    when :TABS
+      hash.each{|key, val|
+        xkey = self.send(@enc, key)
+        xval = self.send(@enc, val)
+        die("newline or tab in key #{xkey}", ENL) if /[\r\n\t]/ =~ xkey
+        die("newline or tab in value #{xval}", ENL) if /[\r\n\t]/ =~ xval
+        @of.puts([xkey, xval].join("\t"))
+      }
+    when :CSV
+      hash.each{|key, val|
+        xkey = self.send(@enc, key).gsub(/"/, '""')
+        xval = self.send(@enc, val).gsub(/"/, '""')
+        die("newline in key #{xkey}", ENL) if /[\r\n]/ =~ xkey
+        die("newline in value #{xval}", ENL) if /[\r\n]/ =~ xval
+        @of.puts ['"', xkey, '","', xval, '"'].join
+      }
+    when :LINES
+      hash.each{|key, val|
+        xkey = self.send(@enc, key)
+        xval = self.send(@enc, val)
+        die("newline in key #{xkey}", ENL) if /[\r\n]/ =~ xkey
+        die("newline in value #{xval}", ENL) if /[\r\n]/ =~ xval
+        @of.puts(xkey)
+        @of.puts(xval)
+      }
+      @of.puts('')
+    when :JSON
+      JSON.dump(hash, @of)
+      @of.puts('')
+    when :YAML
+      YAML.dump(hash, @of)
+      @of.puts('')
+    end
+  end
+
+  # command handler
+
+  def do_keys
+    print_a @hdb.keys
+  end
+
+  def do_val key
+    val = @hdb.fetch(key, nil)
+    die("#{key} not found", ECM) if val.nil?
+    print_s val
+  end
+
+  def do_key val
+    unless @hdb.respond_to?(:key)
+      class << @hdb
+        alias :key :index
+      end
+    end
+    key = @hdb.key(val)
+    die("#{val} not found", ECM) if key.nil?
+    print_s key
+  end
+
+  def do_dump
+    print_h @hdb.to_hash
+  end
+
+  def do_select re
+    rre = Regexp.new(re)
+    r = {}
+    @hdb.each {|key, val|
+      r[key] = val if rre === key
+    }
+    print_h r
+  end
+
+  def do_reject re
+    rre = Regexp.new(re)
+    r = {}
+    @hdb.each {|key, val|
+      r[key] = val unless rre === key
+    }
+    print_h r
+  end
+
+  def do_size 
+    print_s @hdb.size.to_s
+  end
+
+  def do_store key, val
+    @hdb.store key, val
+  end
+
+  def do_check key, val
+    xval = @hdb.fetch(key, nil)
+    die("#{key}=>#{xval}", ECM) if val != xval
+  end
+
+  def do_delete key
+    die("#{key} not found", ECM) unless @hdb.delete(key)
+  end
+
+  def do_clear
+    @hdb.clear
+  end
+
+  def do_isempty
+    not @hdb.empty?
+  end
+
+  def do_haskey
+    die("#{key} not found", ECM) unless @hdb.has_key?(key)
+  end
+
+  def do_merge dbfile2
+    case @db
+    when :DBM
+      DBM.open(dbfile2, nil, DBM::READER) {|db2| @hdb.update(db2) }
+    when :GDBM
+      GDBM.open(dbfile2, nil, GDBM::READER) {|db2| @hdb.update(db2) }
+    when :SDBM
+      SDBM.open(dbfile2, nil) {|db2| @hdb.update(db2) }
+    end
+  end
+
+  def do_import textfile
+    case @fmt
+    when :TABS
+      File.open(textfile, "r") {|fp|
+        for line in fp
+	  key, val = line.chomp.split(/\t/, 2)
+	  unless val
+	    warn "ignored <#{line.chomp}>"
+	  end
+	  key = self.send(@dec, key)
+	  val = self.send(@dec, val)
+	  @hdb[key.to_s] = val.to_s
+	end
+      }
+    when :CSV
+      File.open(textfile, "r") {|fp|
+        for line in fp
+	  val = nil
+	  case line.chomp
+	  when /\A([^",][^,]*),([^",][^,]*)\z/ then key, val = $1, $2
+	  when /\A"([^"]*)","([^"]*)"\z/ then key, val = $1, $2
+	  else
+	    warn("ignored <#{line.chomp}>")
+	    next
+	  end
+	  key = self.send(@dec, key)
+	  val = self.send(@dec, val)
+	  @hdb[key] = val
+	end
+      }
+    when :LINES
+      File.open(textfile, "r") {|fp|
+        rec = []
+        for line in fp
+	  line.chomp!
+	  if line.empty?
+	    key, val = rec
+	    if val
+	      @hdb[key] = val
+	    else
+	      warn("ignored <#{key}>")
+	    end
+	  else
+	    rec.push self.send(@dec, key)
+	  end
+	end
+      }
+    else
+      die("unsupported format #{@fmt}")
+    end
+  end
+
+  def do_reorganize
+    if @hdb.respond_to?(:reorganize) then
+      @hdb.reorganize
+    else
+      warn('reorganize not supported')
+    end
+  end
+
+  # top-level routines
+
+  def cmds hdb
+    @hdb = hdb
+    while cmd = @argv.shift
+      sym = "do_#{cmd}".to_sym
+      case cmd
+      when /\A(keys|dump|size|clear|isempty|reorganize)\z/i then
+        self.send(sym)
+      when /\A(val|key|select|reject|delete|haskey|merge|import)\z/i then
+	arg1 = self.send(@dec, @argv.shift)
+        self.send(sym, arg1)
+      when /\A(store|check)\z/i then
+	arg1 = self.send(@dec, @argv.shift)
+	arg2 = self.send(@dec, @argv.shift)
+        self.send(sym, arg1, arg2)
+      when /\Ahelp\z/i then
+        puts Help
+      else
+        die("unknown command (#{cmd})")
+      end
+    end
+    @hdb = nil
+  end
+
+  def run
+    die!("give me filename as database") unless @dbfile
+    case @db
+    when :DBM then
+      require 'dbm'
+      begin
+        DBM.open(@dbfile, 0666) {|hdb| cmds(hdb) }
+      rescue DBMError => e
+        die(e.message)
+      end
+    when :GDBM then
+      require 'gdbm'
+      begin
+        GDBM.open(@dbfile, 0666) {|hdb| cmds(hdb) }
+      rescue GDBMError => e
+        die(e.message)
+      end
+    when :SDBM then
+      require 'sdbm'
+      begin
+        SDBM.open(@dbfile, 0666) {|hdb| cmds(hdb) }
+      rescue SDBMError => e
+        die(e.message)
+      end
+    else
+      die!("unknown db engine (#{dbname})")
+    end
+    @of.close
+  end
+
+end
+
+App.new(ARGV).run
