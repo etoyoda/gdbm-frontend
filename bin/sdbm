@@ -86,7 +86,7 @@ EOF
   def enc= enc
     @dec = "dec_#{enc.downcase}".to_sym
     @enc = "enc_#{enc.downcase}".to_sym
-    die("unknown enc=#{enc}") unless self.respond?(@enc)
+    die("unknown enc=#{enc}") unless self.respond_to?(@enc)
   end
 
   def of= filename
