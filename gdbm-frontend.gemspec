@@ -3,7 +3,7 @@
 
 Gem::Specification.new do |s|
   s.name = "gdbm-frontend"
-  s.version = "0.0.1"
+  s.version = "0.0.2"
   s.authors = ["TOYODA Eizi"]
   s.autorequire = ["gdbm", "dbm", "sdbm"]
   s.date = "2018-12-17"
